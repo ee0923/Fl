@@ -1,0 +1,217 @@
+name: Build FlClash
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Platforms to build
+        type: choice
+        options: [all, android, linux, macos, windows]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flclash-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FLUTTER_VERSION: '3.47.6'
+  GO_VERSION: '1.27.1'
+  NDK_VERSION: r28c
+  HOMEBREW_NO_ANALYTICS: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Require matching customization
+        env:
+          FLCLASH_CUSTOMIZE_SCRIPT: ${{ secrets.FLCLASH_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh --check-secret
+      - id: targets
+        env:
+          BUILD_TARGET: ${{ inputs.target || 'all' }}
+        run: python scripts/matrix.py "$BUILD_TARGET" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.id }}
+    permissions:
+      contents: write
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout build controls
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Require matching customization
+        env:
+          FLCLASH_CUSTOMIZE_SCRIPT: ${{ secrets.FLCLASH_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh --check-secret
+      - name: Enable git long paths (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: git config --global core.longpaths true
+
+      - name: Fetch locked source and recursive gitlinks over HTTPS
+        run: python scripts/checkout-source.py
+      - name: Apply privacy patch before build tools
+        env:
+          FLCLASH_CUSTOMIZE_SCRIPT: ${{ secrets.FLCLASH_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh
+
+      - name: Require Android release signing
+        if: matrix.platform == 'android'
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: python scripts/sign-android.py
+
+      - name: Setup rust
+        if: startsWith(matrix.os, 'windows-11-arm')
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://win.rustup.rs/aarch64" -OutFile rustup-init.exe
+          .\rustup-init.exe -y --default-toolchain stable
+          $cargoPath = "$env:USERPROFILE\.cargo\bin"
+          Add-Content $env:GITHUB_PATH $cargoPath
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: source/core/go.sum
+
+      - name: Setup Gradle
+        if: startsWith(matrix.platform,'android')
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c
+
+      # Stable publishes no Windows or Linux arm64 archive; master makes the action
+      # clone the SDK at the pinned tag and let it fetch the host's own Dart SDK.
+      - name: Setup Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: ${{ matrix.flutter-channel || 'stable' }}
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Xcode
+        if: startsWith(matrix.platform,'macos')
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+
+      - name: Setup Java
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup NDK
+        if: startsWith(matrix.platform,'android')
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Get Flutter Dependency
+        working-directory: source
+        run: |
+          flutter --version
+          flutter config --no-analytics
+          dart --disable-analytics
+          flutter pub get --enforce-lockfile
+      - name: Regenerate providers without native packaging hooks
+        working-directory: source
+        run: |
+          set -euo pipefail
+          manifest=$(mktemp)
+          cp pubspec.yaml "$manifest"
+          trap 'cp "$manifest" pubspec.yaml; rm -f "$manifest"' EXIT
+          python -c "from pathlib import Path; p=Path('pubspec.yaml'); p.write_text(p.read_text().replace('build_assets: true', 'build_assets: false'))"
+          dart run build_runner build --delete-conflicting-outputs
+      - name: Analyze patched Flutter sources
+        working-directory: source
+        run: flutter analyze --no-fatal-infos
+      - name: Test privacy policy and preserved subscription/update behavior
+        if: matrix.id == 'linux-amd64'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          manifest=$(mktemp)
+          cp pubspec.yaml "$manifest"
+          trap 'cp "$manifest" pubspec.yaml; rm -f "$manifest"' EXIT
+          python -c "from pathlib import Path; p=Path('pubspec.yaml'); p.write_text(p.read_text().replace('build_assets: true', 'build_assets: false'))"
+          flutter test test/privacy_patch_test.dart test/common/request_test.dart test/common/print_test.dart test/common/log_payload_test.dart test/providers/common_action_test.dart
+
+      # See .agents/flutter-upgrade.md before bumping FLUTTER_VERSION.
+      - name: Disable Impeller on Intel macOS
+        if: matrix.platform == 'macos' && matrix.arch == 'amd64'
+        working-directory: source
+        run: plutil -replace FLTEnableImpeller -bool NO macos/Runner/Info.plist
+
+      # The core embeds this bundle and FlClashHttpOverrides.trustCoreRoots loads it for Dart.
+      # Pinned by hash, so a new bundle from https://curl.se/docs/caextract.html is a reviewed bump.
+      - name: Fetch CA certificates
+        shell: bash
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=source/core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Setup
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        working-directory: source
+        run: dart setup.dart ${{ matrix.platform }} --env stable -v
+
+      - name: Verify privacy patch after packaging
+        env:
+          FLCLASH_CUSTOMIZE_SCRIPT: ${{ secrets.FLCLASH_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh --verify
+      - name: Collect complete packages and provenance
+        run: python scripts/package.py "${{ matrix.platform }}" "${{ matrix.arch }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: flclash-package-${{ matrix.id }}
+          path: ./dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish verified target to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE_ID: ${{ matrix.platform }}-${{ matrix.arch }}
+        run: python scripts/publish-release.py "$PACKAGE_ID"
