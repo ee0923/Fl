@@ -1,0 +1,15 @@
+{
+  "name": "FlClash",
+  "repository": "https://github.com/chen08209/FlClash.git",
+  "ref": "v0.9.2",
+  "commit": "7fd417fb9a9a277c6a9339a8ac87f907df7c25f7",
+  "guards": [
+    "pubspec.yaml",
+    "pubspec.lock",
+    "core/go.mod",
+    "core/go.sum",
+    "build_config.yaml",
+    "plugins/rust_api/rust/Cargo.lock",
+    "services/helper/Cargo.lock"
+  ]
+}
